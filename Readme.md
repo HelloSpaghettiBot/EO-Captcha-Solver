@@ -1,3 +1,13 @@
+
+<video src="https://raw.githubusercontent.com/HelloSpaghettiBot/EO-Captcha-Solver/main/screen-20251029-073456~2.mp4"
+       controls
+       loop
+       muted
+       playsinline
+       style="max-width:100%;height:auto;">
+</video>
+
+
 markdown# 🧠 EO Captcha Solver Setup & Usage Guide
 
 ## 📦 Installation
