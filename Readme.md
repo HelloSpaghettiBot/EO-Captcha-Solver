@@ -8,7 +8,7 @@
 </video>
 
 
-markdown# 🧠 EO Captcha Solver Setup & Usage Guide
+# 🧠 EO Captcha Solver Setup & Usage Guide
 
 ## 📦 Installation
 
