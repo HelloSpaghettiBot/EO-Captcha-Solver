@@ -1,0 +1,834 @@
+# EO Captcha Solver GUI (Legacy Solve Mode)
+# - GUI with Tkinter + integrated help/instructions
+# - Auto-finds Tesseract or guides install
+# - Region selection with OpenCV draw boxes
+# - LEGACY SOLVER: sequential per-spot scan, fixed frames+delay, majority vote
+# - Optional Capture Scale (enlarge tiny windows before OCR)
+# - Real SendInput typing
+# - EXE-ready with PyInstaller
+
+import sys, os, re, time, subprocess, webbrowser, threading, queue, ctypes
+import cv2
+import numpy as np
+import pytesseract
+import mss
+from collections import Counter
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import pyautogui
+try:
+    import win32gui, win32con, win32process
+except ImportError:
+    win32gui = win32con = win32process = None
+
+from ctypes import wintypes
+wintypes.ULONG_PTR = wintypes.WPARAM
+
+# ========================= TESSERACT =========================
+def find_tesseract_cmd():
+    env_path = os.environ.get("TESSERACT_PATH")
+    if env_path and Path(env_path).is_file():
+        return env_path
+    try:
+        out = subprocess.run(["tesseract", "-v"], capture_output=True, text=True)
+        if out.returncode == 0:
+            return "tesseract"
+    except Exception:
+        pass
+    try:
+        import winreg
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for subkey in (r"SOFTWARE\Tesseract-OCR", r"SOFTWARE\WOW6432Node\Tesseract-OCR"):
+                try:
+                    with winreg.OpenKey(root, subkey) as k:
+                        inst = winreg.QueryValueEx(k, "InstallDir")[0]
+                        exe = Path(inst) / "tesseract.exe"
+                        if exe.is_file():
+                            return str(exe)
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    for c in [r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+              r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"]:
+        if Path(c).is_file():
+            return c
+    return None
+
+def ensure_tesseract_or_guide_user(parent=None):
+    path = find_tesseract_cmd()
+    if path:
+        pytesseract.pytesseract.tesseract_cmd = path
+        try:
+            out = subprocess.run([path, "-v"], capture_output=True, text=True)
+            if out.returncode == 0:
+                return True
+        except Exception:
+            pass
+    try:
+        messagebox.showwarning(
+            "Tesseract Required",
+            "Tesseract OCR is not installed or not found.\n\n"
+            "Click OK to open the official Windows installer page.\n"
+            "Install it (check 'Add to PATH' during setup), then restart this app."
+        )
+    except Exception:
+        print("[!] Tesseract OCR not found.")
+    try:
+        webbrowser.open("https://github.com/UB-Mannheim/tesseract/wiki")
+    except Exception:
+        pass
+    return False
+
+# ========================= SENDINPUT =========================
+user32 = ctypes.WinDLL('user32', use_last_error=True)
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+MAPVK_VK_TO_VSC = 0
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = (("dx",          wintypes.LONG),
+                ("dy",          wintypes.LONG),
+                ("mouseData",   wintypes.DWORD),
+                ("dwFlags",     wintypes.DWORD),
+                ("time",        wintypes.DWORD),
+                ("dwExtraInfo", wintypes.ULONG_PTR))
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = (("wVk",         wintypes.WORD),
+                ("wScan",       wintypes.WORD),
+                ("dwFlags",     wintypes.DWORD),
+                ("time",        wintypes.DWORD),
+                ("dwExtraInfo", wintypes.ULONG_PTR))
+    def __init__(self, *args, **kw):
+        super(KEYBDINPUT, self).__init__(*args, **kw)
+        if not self.dwFlags & 0x0004:  # not UNICODE
+            self.wScan = user32.MapVirtualKeyExW(self.wVk, MAPVK_VK_TO_VSC, 0)
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (("uMsg",    wintypes.DWORD),
+                ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD))
+
+class INPUT(ctypes.Structure):
+    class _INPUT(ctypes.Union):
+        _fields_ = (("ki", KEYBDINPUT),
+                    ("mi", MOUSEINPUT),
+                    ("hi", HARDWAREINPUT))
+    _anonymous_ = ("_input",)
+    _fields_ = (("type",   wintypes.DWORD),
+                ("_input", _INPUT))
+
+LPINPUT = ctypes.POINTER(INPUT)
+
+def PressKey(vk):
+    x = INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(wVk=vk))
+    user32.SendInput(1, ctypes.byref(x), ctypes.sizeof(x))
+
+def ReleaseKey(vk):
+    x = INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(wVk=vk, dwFlags=KEYEVENTF_KEYUP))
+    user32.SendInput(1, ctypes.byref(x), ctypes.sizeof(x))
+
+VK_MAP = {ch: int(code,16) for ch,code in {
+    'enter':"0x0D",'0':"0x30",'1':"0x31",'2':"0x32",'3':"0x33",'4':"0x34",
+    '5':"0x35",'6':"0x36",'7':"0x37",'8':"0x38",'9':"0x39",'a':"0x41",
+    'b':"0x42",'c':"0x43",'d':"0x44",'e':"0x45",'f':"0x46",'g':"0x47",
+    'h':"0x48",'i':"0x49",'j':"0x4A",'k':"0x4B",'l':"0x4C",'m':"0x4D",
+    'n':"0x4E",'o':"0x4F",'p':"0x50",'q':"0x51",'r':"0x52",'s':"0x53",
+    't':"0x54",'u':"0x55",'v':"0x56",'w':"0x57",'x':"0x58",'y':"0x59",
+    'z':"0x5A"
+}.items()}
+
+def type_text_sendinput(text, interval=0.08, press_enter=True):
+    for ch in text:
+        vk = VK_MAP.get(ch.lower())
+        if vk:
+            PressKey(vk); time.sleep(0.03); ReleaseKey(vk); time.sleep(interval)
+    if press_enter:
+        vk = VK_MAP['enter']; PressKey(vk); time.sleep(0.03); ReleaseKey(vk)
+
+# ========================= OCR PREPROCESS =========================
+OCR_SAT_THRESH = 30
+OCR_V_MIN, OCR_V_MAX = 110, 230
+OCR_MIN_CHAR_AREA_RATIO = 0.002
+OCR_DILATE_KERNEL = 1
+
+def _gray_only_mask(bgr, sat_thresh, vmin, vmax):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    _, s, v = cv2.split(hsv)
+    mask = (s < sat_thresh) & (v >= vmin) & (v <= vmax)
+    return (mask.astype(np.uint8) * 255)
+
+def _area_filter(bin_img, min_area_px):
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(bin_img, connectivity=8)
+    out = np.zeros_like(bin_img)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area_px:
+            out[labels == i] = 255
+    return out
+
+def preprocess_for_letter(bgr, sat_thresh, vmin, vmax, min_area_ratio, dilate_kernel):
+    mask = _gray_only_mask(bgr, sat_thresh, vmin, vmax)
+    masked = cv2.bitwise_and(bgr, bgr, mask=mask)
+    g = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    g = clahe.apply(g)
+    _, bin_img = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    h, w = bin_img.shape[:2]
+    min_area = max(20, int(min_area_ratio * h * w))
+    clean = _area_filter(bin_img, min_area_px=min_area)
+    inv = cv2.bitwise_not(clean)
+    inv = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT,(2,2)), iterations=1)
+    clean = cv2.bitwise_not(inv)
+    if dilate_kernel > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_kernel, dilate_kernel))
+        clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, k, iterations=1)
+    return clean
+
+def ocr_one_letter(bgr):
+    proc = preprocess_for_letter(
+        bgr,
+        sat_thresh=OCR_SAT_THRESH,
+        vmin=OCR_V_MIN, vmax=OCR_V_MAX,
+        min_area_ratio=OCR_MIN_CHAR_AREA_RATIO,
+        dilate_kernel=OCR_DILATE_KERNEL
+    )
+    config = "--oem 1 --psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    txt = pytesseract.image_to_string(proc, config=config)
+    letters = [c for c in txt if c.isalpha()]
+    return letters[0].upper() if letters else ""
+
+# ========================= TRIGGER OCR =========================
+def preprocess_for_line(bgr):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    _, s, v = cv2.split(hsv)
+    mask = (s < 60) & (v > 100)
+    mask = (mask.astype(np.uint8) * 255)
+    masked = cv2.bitwise_and(bgr, bgr, mask=mask)
+    g = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g = clahe.apply(g)
+    _, bin_img = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (1,1))
+    bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_CLOSE, k, iterations=1)
+    bin_img = cv2.resize(bin_img, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+    return bin_img
+
+def ocr_text_line(bgr):
+    proc = preprocess_for_line(bgr)
+    config = "--oem 1 --psm 6"
+    text = pytesseract.image_to_string(proc, config=config)
+    text = text.lower()
+    text = re.sub(r"[^a-z\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# ========================= WINDOW FOCUS =========================
+def _enum_windows_by_title(substr):
+    matches=[]
+    if not win32gui: return matches
+    def _cb(hwnd,_):
+        if win32gui.IsWindowVisible(hwnd):
+            t=win32gui.GetWindowText(hwnd)
+            if substr.lower() in t.lower(): matches.append((hwnd,t))
+    win32gui.EnumWindows(_cb,None)
+    return matches
+
+def _bring_to_foreground(hwnd):
+    if not win32gui: return False
+    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE); time.sleep(0.05)
+    try: win32gui.SetForegroundWindow(hwnd)
+    except Exception: pass
+    fg=win32gui.GetForegroundWindow()
+    if fg!=hwnd:
+        try:
+            user32_win=ctypes.windll.user32
+            cur=win32process.GetWindowThreadProcessId(fg)[0]
+            tgt=win32process.GetWindowThreadProcessId(hwnd)[0]
+            user32_win.AttachThreadInput(cur, tgt, True)
+            win32gui.SetForegroundWindow(hwnd)
+            user32_win.AttachThreadInput(cur, tgt, False)
+        except Exception: pass
+    return win32gui.GetForegroundWindow()==hwnd
+
+def focus_window_by_title(substr, click_center=True):
+    hwnd=None; title=None; L=T=R=B=0
+    if win32gui:
+        m=_enum_windows_by_title(substr)
+        if m:
+            hwnd,title=m[0]
+            if not _bring_to_foreground(hwnd): hwnd=None
+        if hwnd and click_center:
+            L,T,R,B=win32gui.GetWindowRect(hwnd)
+    if hwnd is None:
+        try:
+            wins=pyautogui.getWindowsWithTitle(substr)
+            if wins:
+                w=wins[0]
+                if w.isMinimized: w.restore(); time.sleep(0.1)
+                w.activate(); time.sleep(0.1)
+                title=w.title; L,T,R,B=w.left,w.top,w.right,w.bottom
+            else:
+                return False
+        except Exception:
+            return False
+    if click_center:
+        cx=int((L+R)/2); cy=int((T+B)/2); pyautogui.click(cx,cy); time.sleep(0.08)
+    return True
+
+# ========================= REGION SELECTION (OpenCV) =========================
+def cv_select_single_region(screen, title="Select Region"):
+    saved=None; selecting=False; x1=y1=x2=y2=0
+
+    def mouse_cb(event, x, y, flags, param):
+        nonlocal selecting, x1, y1, x2, y2
+        if event == cv2.EVENT_LBUTTONDOWN:
+            x1,y1=x,y; x2,y2=x,y; selecting=True
+        elif event == cv2.EVENT_MOUSEMOVE and selecting:
+            x2,y2=x,y
+        elif event == cv2.EVENT_LBUTTONUP:
+            x2,y2=x,y; selecting=False
+
+    cv2.namedWindow(title, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(title, mouse_cb)
+
+    while True:
+        display = screen.copy()
+        if saved is not None:
+            pt1=(saved["left"],saved["top"])
+            pt2=(saved["left"]+saved["width"], saved["top"]+saved["height"])
+            cv2.rectangle(display, pt1, pt2, (0,200,0), 2)
+            cv2.putText(display, "Saved", (saved["left"]+5, saved["top"]+20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,200,0), 2, cv2.LINE_AA)
+        if selecting or (x1!=x2 and y1!=y2):
+            cv2.rectangle(display, (x1,y1), (x2,y2), (0,200,255), 1)
+        cv2.putText(display, "[SPACE]=confirm  [ENTER]=done  [BACKSPACE]=clear  [ESC/q]=cancel",
+                    (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 1)
+        cv2.imshow(title, display)
+        key = cv2.waitKey(20)
+        if key == -1: continue
+        if key in (27, ord('q')): cv2.destroyWindow(title); return None
+        if key in (8,127): saved=None; x1=y1=x2=y2=0
+        if key == ord(' '):
+            xa,ya=min(x1,x2),min(y1,y2); xb,yb=max(x1,x2),max(y1,y2); w,h=xb-xa,yb-ya
+            if w>5 and h>5:
+                saved={"left":xa,"top":ya,"width":w,"height":h}
+                x1=y1=x2=y2=0
+        if key in (13,10):
+            if saved is not None:
+                cv2.destroyWindow(title); return saved
+
+def cv_select_multiple_regions(screen, k_required=5, title="Select Letter Spots"):
+    spots=[]; selecting=False; x1=y1=x2=y2=0
+
+    def mouse_cb(event, x, y, flags, param):
+        nonlocal selecting,x1,y1,x2,y2
+        if event == cv2.EVENT_LBUTTONDOWN:
+            x1,y1=x,y; x2,y2=x,y; selecting=True
+        elif event == cv2.EVENT_MOUSEMOVE and selecting:
+            x2,y2=x,y
+        elif event == cv2.EVENT_LBUTTONUP:
+            x2,y2=x,y; selecting=False
+
+    cv2.namedWindow(title, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(title, mouse_cb)
+
+    while True:
+        display = screen.copy()
+        for idx,r in enumerate(spots, start=1):
+            pt1=(r["left"],r["top"]); pt2=(r["left"]+r["width"], r["top"]+r["height"])
+            cv2.rectangle(display, pt1, pt2, (0,200,0), 2)
+            cv2.putText(display, f"{idx}", (r["left"]+5, r["top"]+20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,200,0), 2, cv2.LINE_AA)
+        if selecting or (x1!=x2 and y1!=y2):
+            cv2.rectangle(display, (x1,y1), (x2,y2), (0,200,255), 1)
+        cv2.putText(display,
+                    f"Draw {k_required} spots  [SPACE=confirm]  [ENTER=done]  [BACKSPACE=undo]  [ESC/q=cancel]  Saved:{len(spots)}",
+                    (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 1)
+        cv2.imshow(title, display)
+        key = cv2.waitKey(20)
+        if key == -1: continue
+        if key in (27, ord('q')): cv2.destroyWindow(title); return []
+        if key in (8,127):
+            if spots: spots.pop()
+        if key == ord(' '):
+            xa,ya=min(x1,x2),min(y1,y2); xb,yb=max(x1,x2),max(y1,y2); w,h=xb-xa,yb-ya
+            if w>5 and h>5:
+                spots.append({"left":xa,"top":ya,"width":w,"height":h})
+                x1=y1=x2=y2=0
+        if key in (13,10):
+            if len(spots)==k_required:
+                cv2.destroyWindow(title); return spots
+
+# ========================= LEGACY SOLVER CORE =========================
+class Solver(threading.Thread):
+    def __init__(self, cfg, log_fn, on_tick=None):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.log = log_fn
+        self.on_tick = on_tick
+        self._stop = threading.Event()
+        self.captcha_count = 0
+
+    def stop(self):
+        self._stop.set()
+
+    def phrase_in_region(self, sct, region, phrase):
+        img = np.array(sct.grab(region))[:, :, :3]
+        text = ocr_text_line(img)
+        return phrase.lower() in text
+
+    def wait_for_trigger(self, trigger_region):
+        hits=0
+        with mss.mss() as sct:
+            while not self._stop.is_set():
+                if self.phrase_in_region(sct, trigger_region, self.cfg["trigger_phrase"]):
+                    hits += 1
+                    if hits >= self.cfg["trigger_hits"]:
+                        return True
+                else:
+                    hits = 0
+                time.sleep(self.cfg["trigger_check_delay"])
+        return False
+
+    def scan_region_legacy(self, region):
+        """Classic sequential scan: FRAMES × DELAY, then majority vote."""
+        counts = Counter()
+        frames = self.cfg["frames"]
+        delay = self.cfg["frame_delay"]
+        scale = self.cfg["capture_scale"]
+
+        with mss.mss() as sct:
+            for _ in range(frames):
+                if self._stop.is_set(): break
+                bgr = np.array(sct.grab(region))[:, :, :3]
+                if scale > 1.0:
+                    bgr = cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+                letter = ocr_one_letter(bgr)
+                if letter:
+                    counts[letter] += 1
+                time.sleep(delay)
+
+        if not counts:
+            self.log("  • No letter detected in this spot (returning '?').")
+            return "?"
+        ans = counts.most_common(1)[0][0]
+        return ans
+
+    def solve_once(self):
+        self.captcha_count += 1
+        n = self.captcha_count
+        self.log(f"⏳ [Captcha #{n}] Waiting for trigger '{self.cfg['trigger_phrase']}'…")
+        if not self.wait_for_trigger(self.cfg["trigger_region"]):
+            return False
+        self.log(f"✅ [Captcha #{n}] Trigger detected. Scanning letters (legacy mode)…")
+
+        answers = []
+        for i, reg in enumerate(self.cfg["letter_regions"], start=1):
+            ans = self.scan_region_legacy(reg)
+            answers.append(ans)
+            self.log(f"  • Spot {i}: {ans}")
+
+        solution = "".join([a for a in answers if a and a.isalpha()]).upper()
+        self.log(f"📨 Solution: {solution}")
+
+        if not solution:
+            self.log("⚠️ No letters recognized; skipping type.")
+            return True
+
+        if focus_window_by_title(self.cfg["window_title"], click_center=self.cfg["click_center"]):
+            time.sleep(0.3)
+            self.log("⌨️ Typing into EndlessOnline…")
+            type_text_sendinput(
+                solution,
+                interval=self.cfg["type_interval"],
+                press_enter=self.cfg["press_enter"]
+            )
+        else:
+            self.log("❌ Could not focus EndlessOnline window.")
+        time.sleep(self.cfg["post_solve_cooldown"])
+        return True
+
+    def run(self):
+        while not self._stop.is_set():
+            try:
+                ok = self.solve_once()
+                if not ok:
+                    break
+                if self.on_tick: self.on_tick()
+            except Exception as e:
+                self.log(f"ERROR: {e}")
+                time.sleep(0.5)
+
+# ========================= GUI APP =========================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("EO Captcha Solver (Legacy Mode)")
+        self.geometry("900x580")
+        self.resizable(False, False)
+
+        if not ensure_tesseract_or_guide_user(self):
+            self.destroy()
+            return
+
+        # Legacy-like defaults
+        self.cfg = {
+            "window_title": "EndlessOnline",
+            "trigger_phrase": "reward",
+            "trigger_hits": 2,
+            "trigger_check_delay": 0.5,   # slower, legacy-style
+            "frames": 50,                 # legacy
+            "frame_delay": 0.20,          # legacy
+            "capture_scale": 3.0,         # keep scale option for small windows
+            "type_interval": 0.15,        # safer typing
+            "press_enter": True,
+            "click_center": True,
+            "post_solve_cooldown": 3.0,   # legacy cooldown
+            "trigger_region": None,
+            "letter_regions": []
+        }
+
+        self.ocr_vars = {
+            "sat": tk.IntVar(value=30),
+            "vmin": tk.IntVar(value=110),
+            "vmax": tk.IntVar(value=230),
+            "min_area_ratio": tk.DoubleVar(value=0.002),
+            "dilate": tk.IntVar(value=1),
+        }
+
+        self.solver = None
+        self._build_menu()
+        self._build_ui()
+
+    # ---------- Menu ----------
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        helpm = tk.Menu(menubar, tearoff=0)
+        helpm.add_command(label="Quick Start", command=self.show_quick_start)
+        helpm.add_command(label="How to Select Regions", command=self.show_region_help)
+        helpm.add_command(label="Tesseract Setup", command=self.show_tesseract_help)
+        helpm.add_command(label="Hotkeys & Controls", command=self.show_hotkeys_help)
+        helpm.add_separator()
+        helpm.add_command(label="About", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=helpm)
+        self.config(menu=menubar)
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        # Left: Instructions panel
+        instr = ttk.LabelFrame(self, text="Instructions")
+        instr.place(x=10, y=10, width=330, height=510)
+
+        txt = (
+            "1) Open EndlessOnline.\n"
+            "2) Click 'Select Trigger Area' and draw a box around the 'reward' text. "
+            "SPACE to save, ENTER to finish.\n\n"
+            "3) Click 'Select 5 Letter Spots' and draw 5 boxes—one per letter. "
+            "For each: draw → SPACE. After 5, press ENTER.\n\n"
+            "4) If EO is small, raise 'Capture Scale' (×3–×6).\n"
+            "5) Press Start. The solver waits for 'reward', scans each spot with fixed frames+delay, "
+            "majority-votes, and types the answer.\n"
+        )
+        self.lbl_instr = tk.Text(instr, height=23, wrap="word")
+        self.lbl_instr.insert("1.0", txt)
+        self.lbl_instr.configure(state="disabled")
+        self.lbl_instr.place(x=10, y=10, width=300, height=460)
+        ttk.Button(instr, text="Open Full Help", command=self.show_quick_start).place(x=10, y=470, width=300, height=28)
+
+        # Right side controls
+        top = ttk.LabelFrame(self, text="Main Settings (Legacy)")
+        top.place(x=350, y=10, width=540, height=130)
+
+        ttk.Label(top, text="Window Title:").place(x=10, y=10)
+        self.ent_title = ttk.Entry(top, width=22)
+        self.ent_title.insert(0, self.cfg["window_title"])
+        self.ent_title.place(x=100, y=10)
+
+        ttk.Label(top, text="Trigger Phrase:").place(x=10, y=40)
+        self.ent_phrase = ttk.Entry(top, width=22)
+        self.ent_phrase.insert(0, self.cfg["trigger_phrase"])
+        self.ent_phrase.place(x=100, y=40)
+
+        ttk.Label(top, text="Hits:").place(x=270, y=10)
+        self.sp_hits = ttk.Spinbox(top, from_=1, to=5, width=5)
+        self.sp_hits.delete(0,'end'); self.sp_hits.insert(0, str(self.cfg["trigger_hits"]))
+        self.sp_hits.place(x=305, y=10)
+
+        ttk.Label(top, text="Check Delay (s):").place(x=360, y=10)
+        self.sp_tdelay = ttk.Entry(top, width=6)
+        self.sp_tdelay.insert(0, str(self.cfg["trigger_check_delay"]))
+        self.sp_tdelay.place(x=460, y=10)
+
+        ttk.Label(top, text="Frames:").place(x=270, y=40)
+        self.sp_frames = ttk.Spinbox(top, from_=5, to=300, width=7)
+        self.sp_frames.delete(0,'end'); self.sp_frames.insert(0, str(self.cfg["frames"]))
+        self.sp_frames.place(x=320, y=40)
+
+        ttk.Label(top, text="Frame Delay (s):").place(x=390, y=40)
+        self.sp_fdelay = ttk.Entry(top, width=6)
+        self.sp_fdelay.insert(0, str(self.cfg["frame_delay"]))
+        self.sp_fdelay.place(x=490, y=40)
+
+        ttk.Label(top, text="Capture Scale (×):").place(x=10, y=70)
+        self.scale_capture = ttk.Scale(top, from_=1.0, to=6.0, orient="horizontal")
+        self.scale_capture.set(self.cfg["capture_scale"])
+        self.scale_capture.place(x=120, y=70, width=130)
+
+        ttk.Label(top, text="Type Interval (s):").place(x=270, y=70)
+        self.ent_typeint = ttk.Entry(top, width=6)
+        self.ent_typeint.insert(0, str(self.cfg["type_interval"]))
+        self.ent_typeint.place(x=360, y=70)
+
+        # OCR tuning
+        ocr = ttk.LabelFrame(self, text="OCR Tuning")
+        ocr.place(x=350, y=150, width=540, height=90)
+
+        ttk.Label(ocr, text="SAT<=").place(x=10, y=10)
+        ttk.Spinbox(ocr, from_=0, to=255, textvariable=self.ocr_vars["sat"], width=6).place(x=55, y=10)
+
+        ttk.Label(ocr, text="V min:").place(x=120, y=10)
+        ttk.Spinbox(ocr, from_=0, to=255, textvariable=self.ocr_vars["vmin"], width=6).place(x=165, y=10)
+        ttk.Label(ocr, text="V max:").place(x=220, y=10)
+        ttk.Spinbox(ocr, from_=0, to=255, textvariable=self.ocr_vars["vmax"], width=6).place(x=270, y=10)
+
+        ttk.Label(ocr, text="Min Area Ratio:").place(x=330, y=10)
+        ttk.Entry(ocr, textvariable=self.ocr_vars["min_area_ratio"], width=8).place(x=430, y=10)
+
+        ttk.Label(ocr, text="Dilate k:").place(x=10, y=45)
+        ttk.Spinbox(ocr, from_=0, to=7, textvariable=self.ocr_vars["dilate"], width=6).place(x=65, y=45)
+
+        # Regions
+        reg = ttk.LabelFrame(self, text="Regions")
+        reg.place(x=350, y=250, width=540, height=80)
+
+        ttk.Button(reg, text="Select Trigger Area", command=self.on_select_trigger).place(x=10, y=10, width=170)
+        ttk.Button(reg, text="Select 5 Letter Spots", command=self.on_select_spots).place(x=190, y=10, width=170)
+        self.lbl_reg = ttk.Label(reg, text="Trigger: ❌   Spots: 0/5   (Draw box → SPACE confirm → ENTER done)")
+        self.lbl_reg.place(x=10, y=45)
+
+        # Controls
+        ctrl = ttk.LabelFrame(self, text="Control")
+        ctrl.place(x=350, y=340, width=540, height=60)
+        ttk.Button(ctrl, text="Start", command=self.on_start).place(x=10, y=10, width=120, height=30)
+        ttk.Button(ctrl, text="Stop", command=self.on_stop).place(x=140, y=10, width=120, height=30)
+
+        # Log
+        logf = ttk.LabelFrame(self, text="Log")
+        logf.place(x=350, y=410, width=540, height=120)
+        self.txt = tk.Text(logf, height=6, wrap="word")
+        self.txt.place(x=10, y=5, width=510, height=80)
+        self.txt.configure(state="disabled")
+
+        # Status bar
+        self.status = ttk.Label(self, text="Ready. Legacy solver mode (sequential, majority vote).", anchor="w")
+        self.status.place(x=10, y=530, width=880, height=30)
+
+        self.after(200, self._flush_log_queue)
+
+    # ---------- Help dialogs ----------
+    def show_quick_start(self):
+        self._show_multiline_dialog(
+            "Quick Start",
+            (
+                "QUICK START (Legacy Solve)\n"
+                "1) Open EndlessOnline and log in.\n"
+                "2) Click 'Select Trigger Area' and draw a box around the word 'reward'.\n"
+                "   Draw → SPACE to save → ENTER to finish.\n"
+                "3) Click 'Select 5 Letter Spots' and draw five boxes—one per letter.\n"
+                "   Each: draw → SPACE to save. After all 5, press ENTER.\n"
+                "4) If EO is small, increase 'Capture Scale' (×3–×6).\n"
+                "5) Press Start. The solver waits for 'reward', scans each spot for FRAMES with DELAY between frames, "
+                "majority-votes, and types the answer.\n"
+            )
+        )
+
+    def show_region_help(self):
+        self._show_multiline_dialog(
+            "How to Select Regions",
+            (
+                "REGION SELECTION (OpenCV Window)\n"
+                "• Draw with left mouse.\n"
+                "• SPACE = confirm current rectangle (save)\n"
+                "• ENTER = done\n"
+                "• BACKSPACE = undo last saved (multi-spot)\n"
+                "• ESC / q = cancel\n\n"
+                "Tips:\n"
+                "• Trigger: tight box around 'reward'.\n"
+                "• Spots: tight boxes centered on letters (avoid borders/confetti).\n"
+                "• Small windows? Use higher Capture Scale.\n"
+            )
+        )
+
+    def show_tesseract_help(self):
+        self._show_multiline_dialog(
+            "Tesseract Setup",
+            (
+                "TESSERACT OCR (Windows)\n"
+                "• Install from UB-Mannheim builds.\n"
+                "• Check 'Add to PATH'.\n"
+                "• Or set TESSERACT_PATH to the full path of tesseract.exe (then restart app).\n"
+            )
+        )
+
+    def show_hotkeys_help(self):
+        self._show_multiline_dialog(
+            "Hotkeys & Controls",
+            (
+                "OPEN CV SELECTION HOTKEYS\n"
+                "• SPACE: confirm box\n"
+                "• ENTER: done\n"
+                "• BACKSPACE: undo (multi-spot)\n"
+                "• ESC or q: cancel\n\n"
+                "LEGACY SOLVER NOTES\n"
+                "• Frames: how many snapshots per spot.\n"
+                "• Frame Delay: wait time between snapshots.\n"
+                "• Capture Scale: enlarges region before OCR (helps small UI).\n"
+            )
+        )
+
+    def show_about(self):
+        messagebox.showinfo("About", "EO Captcha Solver — Legacy solving (sequential majority vote).")
+
+    def _show_multiline_dialog(self, title, text):
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry("560x420")
+        win.resizable(False, False)
+        txt = tk.Text(win, wrap="word")
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        txt.place(x=10, y=10, width=540, height=360)
+        ttk.Button(win, text="Close", command=win.destroy).place(x=10, y=375, width=540, height=30)
+
+    # ---------- Logging ----------
+    def log(self, msg):
+        _log_queue.put(msg)
+
+    def _flush_log_queue(self):
+        try:
+            while True:
+                msg = _log_queue.get_nowait()
+                self.txt.configure(state="normal")
+                self.txt.insert("end", msg + "\n")
+                self.txt.see("end")
+                self.txt.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.after(200, self._flush_log_queue)
+
+    # ---------- Region selection actions ----------
+    def on_select_trigger(self):
+        self.status.config(text="Selecting Trigger Area: draw → SPACE confirm → ENTER done (ESC cancel)")
+        messagebox.showinfo(
+            "Select Trigger Area",
+            "Draw a box around the 'reward' text.\n"
+            "Controls: draw with mouse → SPACE to confirm → ENTER to finish.\n"
+            "BACKSPACE=clear saved, ESC/q=cancel."
+        )
+        with mss.mss() as sct:
+            screenshot = np.array(sct.grab(sct.monitors[1]))
+            screen = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
+        r = cv_select_single_region(screen, "Select TRIGGER Area (around 'reward')")
+        if r:
+            self.cfg["trigger_region"] = r
+        self._refresh_region_label()
+        self.status.config(text="Trigger area selection complete." if r else "Trigger area selection cancelled.")
+
+    def on_select_spots(self):
+        self.status.config(text="Selecting 5 Letter Spots: draw → SPACE confirm (x5) → ENTER done (ESC cancel)")
+        messagebox.showinfo(
+            "Select 5 Letter Spots",
+            "Draw five boxes, one for each letter position.\n"
+            "For each: draw → SPACE to save. When all 5 are saved → ENTER.\n"
+            "BACKSPACE=undo last, ESC/q=cancel."
+        )
+        with mss.mss() as sct:
+            screenshot = np.array(sct.grab(sct.monitors[1]))
+            screen = cv2.cvtColor(screenshot, cv2.COLOR_BGRA2BGR)
+        r = cv_select_multiple_regions(screen, k_required=5, title="Select 5 Letter Spots")
+        if r:
+            self.cfg["letter_regions"] = r
+        self._refresh_region_label()
+        self.status.config(text="Letter spots selection complete." if r else "Letter spots selection cancelled.")
+
+    def _refresh_region_label(self):
+        trig_ok = "✅" if self.cfg["trigger_region"] else "❌"
+        k = len(self.cfg["letter_regions"])
+        self.lbl_reg.config(text=f"Trigger: {trig_ok}   Spots: {k}/5   (Draw box → SPACE confirm → ENTER done)")
+
+    # ---------- Apply config ----------
+    def _apply_from_gui(self):
+        self.cfg["window_title"] = self.ent_title.get().strip() or "EndlessOnline"
+        self.cfg["trigger_phrase"] = self.ent_phrase.get().strip() or "reward"
+        try:
+            self.cfg["trigger_hits"] = max(1, int(self.sp_hits.get()))
+        except:
+            self.cfg["trigger_hits"] = 2
+        try:
+            self.cfg["trigger_check_delay"] = max(0.01, float(self.sp_tdelay.get()))
+        except:
+            self.cfg["trigger_check_delay"] = 0.5
+        try:
+            self.cfg["frames"] = max(5, int(self.sp_frames.get()))
+        except:
+            self.cfg["frames"] = 50
+        try:
+            self.cfg["frame_delay"] = max(0.0, float(self.sp_fdelay.get()))
+        except:
+            self.cfg["frame_delay"] = 0.20
+
+        self.cfg["capture_scale"] = float(f"{self.scale_capture.get():.2f}")
+        try:
+            self.cfg["type_interval"] = max(0.0, float(self.ent_typeint.get()))
+        except:
+            self.cfg["type_interval"] = 0.15
+
+        self.cfg["press_enter"] = True
+        self.cfg["click_center"] = True
+
+        # bind OCR globals
+        global OCR_SAT_THRESH, OCR_V_MIN, OCR_V_MAX, OCR_MIN_CHAR_AREA_RATIO, OCR_DILATE_KERNEL
+        OCR_SAT_THRESH = int(self.ocr_vars["sat"].get())
+        OCR_V_MIN = int(self.ocr_vars["vmin"].get())
+        OCR_V_MAX = int(self.ocr_vars["vmax"].get())
+        OCR_MIN_CHAR_AREA_RATIO = float(self.ocr_vars["min_area_ratio"].get())
+        OCR_DILATE_KERNEL = int(self.ocr_vars["dilate"].get())
+
+    # ---------- Start/Stop ----------
+    def on_start(self):
+        if not self.cfg["trigger_region"] or len(self.cfg["letter_regions"]) != 5:
+            messagebox.showerror("Missing Regions", "Select the Trigger area and all 5 Letter spots first.")
+            return
+        self._apply_from_gui()
+        if self.solver and self.solver.is_alive():
+            messagebox.showinfo("Running", "Solver already running.")
+            return
+        self.log("▶ Starting solver (legacy mode)…")
+        self.status.config(text="Solver running… waiting for trigger text.")
+        self.solver = Solver(self.cfg, self.log)
+        self.solver.start()
+
+    def on_stop(self):
+        if self.solver:
+            self.log("⏹ Stopping solver…")
+            self.status.config(text="Stopping solver…")
+            self.solver.stop()
+            self.solver = None
+            self.status.config(text="Stopped.")
+
+# -------------- main --------------
+_log_queue = queue.Queue()
+
+def main():
+    app = App()
+    if app.winfo_exists():
+        app.mainloop()
+
+if __name__ == "__main__":
+    if sys.platform.startswith("win") and win32gui is None:
+        print("Note: pywin32 not found. Focusing uses pyautogui fallback. For best results: pip install pywin32")
+    main()
